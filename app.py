@@ -1,0 +1,913 @@
+"""
+نظام بصير للرصد والفرز الإسعافي والأمني المبكر
+Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
+========================================================================
+- Complete 22-Class Taxonomy Architecture
+- Zero Key Collision Guarantee (Unique Enumerated Keys)
+- Anti-Ghosting / Clutter-Free Spatial Filtering
+
+REWRITE NOTE
+------------
+The previous version drove playback with a blocking `while` loop + `time.sleep()`
+inside a single script run. Every frame paid for image encoding + websocket
+transfer + HTML re-render, and the sleep never accounted for that cost, so real
+throughput fell further behind the requested FPS the longer it ran (the "lag" that
+did not appear when running the same processing code outside Streamlit).
+
+This version uses `st.fragment(run_every=...)`: Streamlit's own scheduler paces
+one-frame-at-a-time updates to the video/KPI/triage panel, instead of a Python
+loop trying to do its own pacing. Concretely:
+  - No more manual time.sleep() drift.
+  - The sidebar stays interactive while a session is playing (you can retune
+    sensitivity mid-run) because only the fragment reruns, not the whole app.
+  - A working Pause/Resume, because playback is no longer a single blocking call.
+"""
+
+import math
+import os
+import tempfile
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+
+import cv2
+import numpy as np
+import streamlit as st
+
+# ============================================================================
+# PAGE CONFIG & COMMAND CENTER THEME
+# ============================================================================
+
+st.set_page_config(
+    page_title="بصير | منصة الرصد والفرز المبكر الموحدة",
+    page_icon="🚑",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&family=JetBrains+Mono:wght@500;700&display=swap');
+    * { font-family: 'Tajawal', -apple-system, sans-serif; }
+    code, .mono { font-family: 'JetBrains Mono', monospace !important; }
+
+    .block-container { padding-top: 1.2rem; max-width: 1440px; }
+    .header-box {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        background: linear-gradient(135deg, #0B132B 0%, #1C2541 100%);
+        padding: 1rem 1.4rem;
+        border-radius: 12px;
+        border: 1px solid #3A506B;
+        margin-bottom: 1.2rem;
+    }
+    .system-title {
+        font-size: 1.85rem;
+        font-weight: 900;
+        background: linear-gradient(90deg, #48CAE4, #00B4D8, #90E0EF);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin: 0;
+    }
+    .system-sub { color: #94A3B8; font-size: 0.88rem; margin: 0.2rem 0 0 0; }
+
+    .live-badge {
+        background: #DC2626;
+        color: white;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 0.75rem;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+    }
+    .kpi-container {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 0.5rem;
+        margin: 0.5rem 0 0.8rem 0;
+    }
+    .kpi-card {
+        background: #0D1B2A;
+        border: 1px solid #1E293B;
+        border-radius: 8px;
+        padding: 0.5rem 0.4rem;
+        text-align: center;
+    }
+    .kpi-num { font-size: 1.25rem; font-weight: 700; color: #38BDF8; font-family: 'JetBrains Mono', monospace; }
+    .kpi-title { font-size: 0.72rem; color: #64748B; font-weight: 700; }
+
+    .alert-card {
+        background: #0F172A;
+        border: 1px solid #1E293B;
+        border-radius: 10px;
+        padding: 0.9rem;
+        margin-bottom: 0.8rem;
+    }
+    .triage-badge {
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 0.7rem;
+        font-weight: 800;
+        color: white;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    .card-ar { font-size: 1.05rem; font-weight: 800; color: #F8FAFC; margin-top: 0.4rem; }
+    .card-en { font-size: 0.82rem; color: #94A3B8; margin-bottom: 0.25rem; }
+    .card-meta { color: #64748B; font-size: 0.78rem; font-family: 'JetBrains Mono', monospace; }
+    .category-tag {
+        display: inline-block;
+        background: rgba(56, 189, 248, 0.12);
+        color: #38BDF8;
+        border-radius: 4px;
+        padding: 1px 6px;
+        font-size: 0.7rem;
+        margin-bottom: 0.3rem;
+    }
+    .eta-box {
+        background: rgba(16, 185, 129, 0.12);
+        border: 1px solid #10B981;
+        color: #10B981;
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-weight: 700;
+        font-size: 0.82rem;
+        text-align: center;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ============================================================================
+# EXACT 22-CLASS TAXONOMY MAPPING
+# ============================================================================
+
+TAXONOMY_RULES = {
+    # 1. Physical Violence & Assaults
+    "boxing_fighting": {
+        "category": "Physical Violence & Assaults",
+        "ar": "مضاربة كيك بوكسنغ واعتداء جسدي",
+        "en": "boxing_fighting",
+        "priority": "High",
+        "color": "#F97316",
+        "icon": "🥊",
+        "action": "توجيه دورية أمن الميدان فوراً لفض الاشتباك",
+    },
+    "kicking_assault": {
+        "category": "Physical Violence & Assaults",
+        "ar": "مضاربة واعتداء بالركل",
+        "en": "kicking_assault",
+        "priority": "High",
+        "color": "#F97316",
+        "icon": "🥋",
+        "action": "توجيه الأمن الميداني وتأمين المارة",
+    },
+
+    # 2. Falls & Abnormal Locomotion
+    "sudden_fall": {
+        "category": "Falls & Abnormal Locomotion",
+        "ar": "سقوط مفاجئ وفقدان فوري للتوازن",
+        "en": "sudden_fall",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "🚨",
+        "action": "توجيه فرقة الإنعاش القلبي والتدخل السريع",
+    },
+    "slow_fall": {
+        "category": "Falls & Abnormal Locomotion",
+        "ar": "سقوط بطيء وتدريجي (هبوط إعياء)",
+        "en": "slow_fall",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "⬇️",
+        "action": "فحص العلامات الحيوية ونقل المصاب للتبريد",
+    },
+    "fall_and_recovery": {
+        "category": "Falls & Abnormal Locomotion",
+        "ar": "تعثر وسقوط مع محاولة النهوض",
+        "en": "fall_and_recovery",
+        "priority": "Medium",
+        "color": "#F59E0B",
+        "icon": "🔄",
+        "action": "المراقبة البصرية ومساندة الحركة",
+    },
+    "severe_gait_limping": {
+        "category": "Falls & Abnormal Locomotion",
+        "ar": "عرج شديد ومطرد (إجهاد حاد)",
+        "en": "severe_gait_limping",
+        "priority": "High",
+        "color": "#F97316",
+        "icon": "🚶",
+        "action": "توجيه كرسي إسعافي متحرك لنقل المصاب",
+    },
+    "irregular_limping": {
+        "category": "Falls & Abnormal Locomotion",
+        "ar": "عرج خفيف غير منتظم",
+        "en": "irregular_limping",
+        "priority": "Medium",
+        "color": "#F59E0B",
+        "icon": "👣",
+        "action": "تنبيه نقطة الرعاية الميدانية القريبة",
+    },
+    "crawling_on_floor": {
+        "category": "Falls & Abnormal Locomotion",
+        "ar": "زحف كامل على الأرض وعدم قدرة على الوقوف",
+        "en": "crawling_on_floor",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "🚷",
+        "action": "إرسال نقالة طبية عاجلة لمنع الدهس",
+    },
+    "crawling_exhausted": {
+        "category": "Falls & Abnormal Locomotion",
+        "ar": "حبـو وإجهاد بدني شديد من التعب",
+        "en": "crawling_exhausted",
+        "priority": "High",
+        "color": "#F97316",
+        "icon": "🧎",
+        "action": "توجيه مسعف مباشر لتزويده بالسوائل",
+    },
+    "stooped_walking_resting": {
+        "category": "Falls & Abnormal Locomotion",
+        "ar": "مشي بظهر منحنٍ واستناد للراحة عند الرصيف",
+        "en": "stooped_walking_resting",
+        "priority": "High",
+        "color": "#F97316",
+        "icon": "🧍",
+        "action": "نقل المصاب إلى مظلة رعاية وتفقد الضغط",
+    },
+    "arm_injury": {
+        "category": "Falls & Abnormal Locomotion",
+        "ar": "إصابة والتواء في الذراع / اليد",
+        "en": "arm_injury",
+        "priority": "Medium",
+        "color": "#F59E0B",
+        "icon": "🩹",
+        "action": "توجيه حقيبة إسعافات أولية لتثبيت الذراع",
+    },
+
+    # 3. Medical & Respiratory Distress
+    "severe_choking_on_ground": {
+        "category": "Medical & Respiratory Distress",
+        "ar": "اختناق وسعال حاد مع استلقاء على الأرض",
+        "en": "severe_choking_on_ground",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "🫁",
+        "action": "تأمين مجرى التنفس والتدخل الإسعافي الفوري",
+    },
+    "choking_cough": {
+        "category": "Medical & Respiratory Distress",
+        "ar": "كحة واختناق ناتج عن الأدخنة أو الغبار",
+        "en": "choking_cough",
+        "priority": "High",
+        "color": "#F97316",
+        "icon": "💨",
+        "action": "توفير قناع أكسجين ونقل المصاب لمنطقة مهواة",
+    },
+    "seizure_convulsion": {
+        "category": "Medical & Respiratory Distress",
+        "ar": "تشنج عصبي نشط ونوبة صرع",
+        "en": "seizure_convulsion",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "⚡",
+        "action": "حماية رأس المصاب وتأمين المحيط فوراً",
+    },
+    "rapid_breathing": {
+        "category": "Medical & Respiratory Distress",
+        "ar": "نهث وتسارع غير طبيعي في التنفس",
+        "en": "rapid_breathing",
+        "priority": "Medium",
+        "color": "#F59E0B",
+        "icon": "🫀",
+        "action": "تهدئة المصاب وقياس نسبة تشبع الأكسجين",
+    },
+
+    # 4. Fast Movement & Dynamic Activities
+    "running_sprinting": {
+        "category": "Fast Movement & Dynamic Activities",
+        "ar": "جري وركض سريع في المسار",
+        "en": "running_sprinting",
+        "priority": "Low",
+        "color": "#3B82F6",
+        "icon": "🏃",
+        "action": "مراقبة التدفق لمنع التدافع العشوائي",
+    },
+    "jogging": {
+        "category": "Fast Movement & Dynamic Activities",
+        "ar": "هرولة اعتيادية",
+        "en": "jogging",
+        "priority": "Low",
+        "color": "#3B82F6",
+        "icon": "🏃",
+        "action": "مراقبة اعتيادية",
+    },
+    "jumping": {
+        "category": "Fast Movement & Dynamic Activities",
+        "ar": "قفز حركي متكرر",
+        "en": "jumping",
+        "priority": "Low",
+        "color": "#3B82F6",
+        "icon": "🦘",
+        "action": "مراقبة اعتيادية",
+    },
+    "dancing": {
+        "category": "Fast Movement & Dynamic Activities",
+        "ar": "حركات رقص أو استعراض",
+        "en": "dancing",
+        "priority": "Low",
+        "color": "#3B82F6",
+        "icon": "💃",
+        "action": "مراقبة اعتيادية",
+    },
+    "situps_exercise": {
+        "category": "Fast Movement & Dynamic Activities",
+        "ar": "تمرين الـ Situp / تمارين بدنية أرضية",
+        "en": "situps_exercise",
+        "priority": "Low",
+        "color": "#3B82F6",
+        "icon": "🧘",
+        "action": "مراقبة اعتيادية",
+    },
+
+    # 5. Object Interaction & Environmental Events
+    "bag_throwing_airborne": {
+        "category": "Object Interaction & Events",
+        "ar": "طيران الشنطة / قذف حقيبة في الهواء",
+        "en": "bag_throwing_airborne",
+        "priority": "Medium",
+        "color": "#F59E0B",
+        "icon": "🎒",
+        "action": "فحص أمني فوري لموقع الحقيبة",
+    },
+    "flying_papers": {
+        "category": "Object Interaction & Events",
+        "ar": "تطاير أوراق أو أجسام خفيفة مع الرياح",
+        "en": "flying_papers",
+        "priority": "Low",
+        "color": "#3B82F6",
+        "icon": "📄",
+        "action": "تنبيه فرق النظافة والصيانة الميدانية",
+    },
+}
+
+PRIORITY_COLOR = {"Critical": "#DC2626", "High": "#F97316", "Medium": "#F59E0B", "Low": "#3B82F6"}
+
+LOCATIONS = [
+    "ممشى المشاعر – ممر رقم 12 (Pilgrim Corridor 12)",
+    "ساحة الحرم المركزية – بوابة الملك فهد (King Fahd Gate)",
+    "محطة قطار الحرمين – الصالة 2 (Train Station Hub)",
+    "المستشفى الميداني – محيط جسر الجمرات (Jamarat Bridge)",
+]
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+@dataclass
+class Alert:
+    id: str
+    unique_key: str
+    frame_idx: int
+    video_time_s: float
+    wall_clock: str
+    location: str
+    condition_key: str
+    confidence: float
+    dispatched: bool = False
+
+
+class Track:
+    def __init__(self, track_id, centroid, bbox, frame_idx):
+        self.id = track_id
+        self.history = deque(maxlen=45)
+        self.age = 0
+        self.update(centroid, bbox, frame_idx)
+
+    def update(self, centroid, bbox, frame_idx):
+        self.centroid = centroid
+        self.bbox = bbox
+        self.last_seen = frame_idx
+        self.age += 1
+        self.history.append({"c": centroid, "b": bbox, "f": frame_idx})
+
+
+def extract_features(track: Track):
+    hist = list(track.history)
+    if len(hist) < 8:
+        return None
+
+    heights = [h["b"][3] for h in hist]
+    widths = [h["b"][2] for h in hist]
+    cxs = [h["c"][0] for h in hist]
+    cys = [h["c"][1] for h in hist]
+
+    curr_h = max(heights[-1], 20.0)
+    aspect_ratios = [w / max(h, 1.0) for w, h in zip(widths, heights)]
+
+    aspect_curr = float(np.mean(aspect_ratios[-4:]))
+    aspect_prev = float(np.mean(aspect_ratios[:4]))
+
+    h_drop = (np.mean(heights[:4]) - np.mean(heights[-4:])) / max(np.mean(heights[:4]), 1.0)
+    vert_v = np.diff(cys) / curr_h
+    horiz_v = np.diff(cxs) / curr_h
+
+    displacement = math.hypot(cxs[-1] - cxs[0], cys[-1] - cys[0]) / curr_h
+    speed_mean = float(np.mean(np.abs(horiz_v))) if len(horiz_v) else 0.0
+    speed_jitter = float(np.std(horiz_v)) if len(horiz_v) else 0.0
+
+    return dict(
+        aspect_curr=aspect_curr,
+        aspect_prev=aspect_prev,
+        h_drop=h_drop,
+        max_vert_v=float(np.max(np.abs(vert_v))) if len(vert_v) else 0.0,
+        displacement=displacement,
+        speed_mean=speed_mean,
+        speed_jitter=speed_jitter,
+    )
+
+
+def classify_taxonomy(f: dict, sensitivity: int):
+    s = sensitivity / 100.0
+
+    # 1. Sudden Fall vs Slow Fall
+    if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.32 * (1.1 - 0.3 * s)) or (
+        f["aspect_prev"] < 0.90 and f["aspect_curr"] > 1.12 and f["max_vert_v"] > 0.05
+    ):
+        return "sudden_fall", min(0.98, 0.78 + 0.18 * s)
+
+    if 0.22 < f["h_drop"] <= 0.32 and f["aspect_curr"] > 1.0:
+        return "slow_fall", min(0.91, 0.65 + 0.2 * s)
+
+    # 2. Prolonged Ground Immobilization & Seizures
+    prone = f["aspect_curr"] > 1.15
+    if prone and f["displacement"] < 0.18:
+        if f["speed_jitter"] > 0.04:
+            return "seizure_convulsion", min(0.95, 0.72 + 0.2 * s)
+        return "severe_choking_on_ground", min(0.92, 0.68 + 0.2 * s)
+
+    # 3. Stooped Walking / Rest
+    if 0.15 < f["h_drop"] <= 0.28 and f["aspect_curr"] < 1.05:
+        return "stooped_walking_resting", min(0.86, 0.55 + f["h_drop"] * 0.7)
+
+    # 4. Gait Limping
+    if not prone and f["speed_jitter"] > 0.042 * (1.1 - 0.3 * s):
+        return "severe_gait_limping", min(0.88, 0.55 + f["speed_jitter"] * 4.0)
+
+    return None, 0.0
+
+
+# ============================================================================
+# OPENCV ENGINE (ANTI-CLUTTER FILTERED)
+# ============================================================================
+
+# Built once at import time instead of once per frame.
+_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+
+
+def new_engine_state():
+    bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
+    return {"bg": bg, "tracks": {}, "next_id": 1, "global_cd": {}}
+
+
+def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
+    fgmask = state["bg"].apply(frame)
+    _, fgmask = cv2.threshold(fgmask, 220, 255, cv2.THRESH_BINARY)
+    fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, _KERNEL_OPEN, iterations=1)
+    fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_CLOSE, _KERNEL_CLOSE, iterations=3)
+
+    contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    detections = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        if w < 30 or h < 30:
+            continue
+        detections.append(((x + w / 2, y + h / 2), (x, y, w, h), area))
+
+    # Keep top 2 largest candidates to isolate true human targets
+    detections = sorted(detections, key=lambda d: d[2], reverse=True)[:2]
+
+    assigned = set()
+    for (cx, cy), (x, y, w, h), _ in detections:
+        best_id, best_d = None, 120.0
+        for tid, tr in state["tracks"].items():
+            if tid in assigned:
+                continue
+            d = math.hypot(tr.centroid[0] - cx, tr.centroid[1] - cy)
+            if d < best_d:
+                best_d, best_id = d, tid
+        if best_id is not None:
+            state["tracks"][best_id].update((cx, cy), (x, y, w, h), frame_idx)
+            assigned.add(best_id)
+        else:
+            tid = state["next_id"]
+            state["next_id"] += 1
+            state["tracks"][tid] = Track(tid, (cx, cy), (x, y, w, h), frame_idx)
+            assigned.add(tid)
+
+    # Prune stale tracks
+    for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 12]:
+        del state["tracks"][tid]
+
+    canvas = frame.copy()
+    new_alerts = []
+    active_count = 0
+
+    for tid, tr in state["tracks"].items():
+        if tr.last_seen != frame_idx or tr.age < 8:
+            continue
+
+        active_count += 1
+        x, y, w, h = tr.bbox
+        f = extract_features(tr)
+        color, tag = (40, 200, 100), f"ID {tid} - Normal (0)"
+
+        if f:
+            cond, conf = classify_taxonomy(f, sensitivity)
+            if cond and cond in TAXONOMY_RULES:
+                color = (40, 40, 235)
+                info = TAXONOMY_RULES[cond]
+                tag = f"Abnormal: {info['en']}"
+
+                last_f = state["global_cd"].get(cond, -9999)
+                if frame_idx - last_f > 130:
+                    state["global_cd"][cond] = frame_idx
+                    new_alerts.append((cond, conf))
+            elif f["speed_jitter"] > 0.025:
+                color, tag = (0, 190, 245), f"ID {tid} - Monitoring"
+
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(canvas, tag, (x, max(y - 8, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
+
+    return canvas, new_alerts, active_count
+
+
+# ============================================================================
+# SYNTHETIC SIMULATION PIPELINE
+# ============================================================================
+
+SIM_PHASES = ["normal_walk", "severe_gait_limping", "stooped_walking_resting", "sudden_fall", "severe_choking_on_ground"]
+SIM_PHASE_LEN = 65
+
+
+def process_sim(frame_idx, state, sensitivity, w, h):
+    p_idx = (frame_idx % (SIM_PHASE_LEN * len(SIM_PHASES))) // SIM_PHASE_LEN
+    phase = SIM_PHASES[p_idx]
+    t = (frame_idx % SIM_PHASE_LEN) / SIM_PHASE_LEN
+    ground = h - 60
+
+    if phase == "normal_walk":
+        bw, bh = 46, 125
+        cx, cy = w * 0.2 + t * w * 0.4, ground - bh / 2
+    elif phase == "severe_gait_limping":
+        bw, bh = 50, 120
+        cx, cy = w * 0.6 + math.sin(t * 22) * 16, ground - bh / 2
+    elif phase == "stooped_walking_resting":
+        bw, bh = 56 + t * 15, 120 - t * 45
+        cx, cy = w * 0.65, ground - bh / 2
+    elif phase == "sudden_fall":
+        c = min(1.0, t / 0.32)
+        bw, bh = 50 + c * 70, 120 - c * 90
+        cx, cy = w * 0.65, ground - bh / 2
+    else:
+        bw, bh = 125, 30
+        cx, cy = w * 0.65, ground - 16
+
+    canvas = np.full((h, w, 3), (11, 19, 43), dtype=np.uint8)
+    cv2.line(canvas, (0, ground), (w, ground), (58, 80, 107), 2)
+    cv2.ellipse(canvas, (int(cx), int(cy)), (max(int(bw / 2), 6), max(int(bh / 2), 6)), 0, 0, 360, (144, 224, 239), -1)
+
+    tid = 1
+    if tid not in state["tracks"]:
+        state["tracks"][tid] = Track(tid, (cx, cy), (cx - bw / 2, cy - bh / 2, bw, bh), frame_idx)
+    else:
+        state["tracks"][tid].update((cx, cy), (cx - bw / 2, cy - bh / 2, bw, bh), frame_idx)
+
+    feats = extract_features(state["tracks"][tid])
+    new_alerts = []
+    color, tag = (40, 200, 100), "Normal: 0"
+
+    if feats:
+        cond, conf = classify_taxonomy(feats, sensitivity)
+        if cond and cond in TAXONOMY_RULES:
+            color = (40, 40, 235)
+            tag = f"Abnormal: {TAXONOMY_RULES[cond]['en']}"
+            last_f = state["global_cd"].get(cond, -9999)
+            if frame_idx - last_f > 85:
+                state["global_cd"][cond] = frame_idx
+                new_alerts.append((cond, conf))
+
+    x, y = int(cx - bw / 2), int(cy - bh / 2)
+    cv2.rectangle(canvas, (x, y), (x + int(bw), y + int(bh)), color, 2)
+    cv2.putText(canvas, tag, (x, max(y - 8, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
+    return canvas, new_alerts, 1
+
+
+# ============================================================================
+# SESSION-STATE PLAYBACK ENGINE
+# (everything the fragment needs to persist between one-frame-at-a-time ticks)
+# ============================================================================
+
+_DEFAULT_STATE = {
+    "alerts": [],
+    "metrics": {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0},
+    "last_img": None,
+    "playing": False,
+    "is_sim": True,
+    "cap": None,
+    "tfile_path": None,
+    "w": 640,
+    "h": 400,
+    "fps_src": 25.0,
+    "total_frames": 0,
+    "frame_idx": 0,
+    "proc": 0,
+    "start_t": 0.0,
+    "eng": None,
+    "zone_at_start": None,
+}
+
+for _k, _v in _DEFAULT_STATE.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+
+def _cleanup_playback():
+    cap = st.session_state.get("cap")
+    if cap is not None:
+        try:
+            cap.release()
+        except Exception:
+            pass
+    st.session_state.cap = None
+
+    tpath = st.session_state.get("tfile_path")
+    if tpath and os.path.exists(tpath):
+        try:
+            os.remove(tpath)
+        except Exception:
+            pass
+    st.session_state.tfile_path = None
+
+
+def advance_one_frame(sensitivity, zone):
+    """Process exactly one frame and store the result in session state.
+    Called at most once per fragment tick -> paced by run_every, not by sleep().
+    """
+    ss = st.session_state
+    ss.frame_idx += 1
+
+    if ss.is_sim:
+        frame_bgr, evts, tracks = process_sim(ss.frame_idx, ss.eng, sensitivity, ss.w, ss.h)
+    else:
+        ok, raw = ss.cap.read()
+        if not ok:
+            ss.proc = ss.total_frames  # signal "finished" to the caller
+            return
+        raw = cv2.resize(raw, (ss.w, ss.h))
+        frame_bgr, evts, tracks = process_video_frame(raw, ss.frame_idx, ss.eng, sensitivity)
+
+    for cond, conf in evts:
+        seq_num = len(ss.alerts) + 1
+        ss.alerts.append(
+            Alert(
+                id=f"EMS-{seq_num:03d}",
+                unique_key=f"{seq_num}_{ss.frame_idx}_{int(time.time() * 1000)}",
+                frame_idx=ss.frame_idx,
+                video_time_s=ss.frame_idx / ss.fps_src,
+                wall_clock=datetime.now().strftime("%H:%M:%S"),
+                location=zone,
+                condition_key=cond,
+                confidence=conf,
+            )
+        )
+
+    ss.last_img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    ss.proc += 1
+    elapsed = max(time.time() - ss.start_t, 1e-6)
+    ss.metrics = {
+        "frame": ss.frame_idx,
+        "tracks": tracks,
+        "fps": ss.proc / elapsed if ss.proc else 0.0,
+        "time": ss.frame_idx / ss.fps_src,
+    }
+
+
+# ============================================================================
+# HEADER
+# ============================================================================
+
+st.markdown(
+    """
+    <div class="header-box">
+        <div>
+            <div class="system-title">🚑 نظام بصير | AI Anomaly Detection & Triage</div>
+            <div class="system-sub">منظومة الرصد والفرز الذكي للمؤشرات الحيوية والحركية وفق معيار التصنيف المعتمد (22 Class Taxonomy)</div>
+        </div>
+        <div class="live-badge">● LIVE DISPATCH SYSTEM</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ============================================================================
+# SIDEBAR CONTROLS
+# ============================================================================
+
+with st.sidebar:
+    st.markdown("### 🎛️ غرفة العمليات والتحكم")
+    st.caption("Operations & Taxonomy Control Hub")
+
+    feed_mode = st.radio(
+        "مصدر البث (Feed Source)",
+        ["وضع المحاكاة التفاعلي (Simulation Mode)", "رفع فيديو مراقبة (Upload Video)"],
+    )
+
+    uploaded_vid = None
+    if feed_mode == "رفع فيديو مراقبة (Upload Video)":
+        uploaded_vid = st.file_uploader("اختر مقطع الكاميرا (.mp4)", type=["mp4", "avi", "mov"])
+
+    st.markdown("---")
+    selected_zone = st.selectbox("نطاق الكاميرا والموقع (Zone)", LOCATIONS)
+    sens = st.slider("حساسية الرصد والاستجابة (Sensitivity)", 20, 100, 60)
+
+    st.markdown("---")
+    play_speed = st.slider("معدل العرض (FPS)", 6, 30, 16)
+    max_f = st.slider("إجمالي الإطارات للفحص (Max Frames)", 80, 800, 320, step=20)
+
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    start_btn = col1.button("▶ بدء", use_container_width=True, type="primary")
+    pause_label = "⏸ إيقاف" if st.session_state.playing else "⏵ استئناف"
+    pause_btn = col2.button(pause_label, use_container_width=True, disabled=st.session_state.total_frames == 0)
+    reset_btn = col3.button("⟲ إعادة", use_container_width=True)
+
+    if st.session_state.total_frames:
+        st.caption(f"الإطار {st.session_state.proc}/{st.session_state.total_frames}")
+
+# ----- Handle sidebar button actions (these always trigger a full app rerun,
+# so the fragment below is redefined with the right run_every afterwards) -----
+
+if start_btn:
+    _cleanup_playback()
+    st.session_state.alerts = []
+    st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
+    st.session_state.last_img = None
+    st.session_state.frame_idx = 0
+    st.session_state.proc = 0
+    st.session_state.start_t = time.time()
+    st.session_state.eng = new_engine_state()
+    st.session_state.zone_at_start = selected_zone
+
+    if feed_mode.startswith("وضع المحاكاة"):
+        st.session_state.is_sim = True
+        st.session_state.w, st.session_state.h = 640, 400
+        st.session_state.fps_src = 25.0
+        st.session_state.total_frames = max_f
+        st.session_state.playing = True
+    else:
+        if uploaded_vid is None:
+            st.warning("الرجاء رفع ملف فيديو أولاً.")
+            st.session_state.playing = False
+            st.session_state.total_frames = 0
+        else:
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tf.write(uploaded_vid.read())
+            tf.close()
+            cap = cv2.VideoCapture(tf.name)
+            fps_src = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            v_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or max_f
+            st.session_state.is_sim = False
+            st.session_state.cap = cap
+            st.session_state.tfile_path = tf.name
+            st.session_state.w, st.session_state.h = 640, 400
+            st.session_state.fps_src = fps_src
+            st.session_state.total_frames = min(max_f, v_total)
+            st.session_state.playing = True
+
+if pause_btn:
+    st.session_state.playing = not st.session_state.playing
+
+if reset_btn:
+    _cleanup_playback()
+    st.session_state.alerts = []
+    st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
+    st.session_state.last_img = None
+    st.session_state.playing = False
+    st.session_state.frame_idx = 0
+    st.session_state.proc = 0
+    st.session_state.total_frames = 0
+    st.session_state.eng = None
+
+# ============================================================================
+# LIVE DASHBOARD FRAGMENT
+# Only this piece auto-reruns (at 1/play_speed seconds) while playing == True.
+# When paused/finished/never started, run_every is None: no auto-rerun at all.
+# ============================================================================
+
+_frame_interval = (1.0 / play_speed) if st.session_state.playing else None
+
+
+def _render_kpis(holder, m, n_alerts):
+    holder.markdown(
+        f"""
+        <div class="kpi-container">
+            <div class="kpi-card"><div class="kpi-num">{m['frame']}</div><div class="kpi-title">الإطار (Frame)</div></div>
+            <div class="kpi-card"><div class="kpi-num">{m['time']:.1f}s</div><div class="kpi-title">الزمن (Time)</div></div>
+            <div class="kpi-card"><div class="kpi-num">{m['tracks']}</div><div class="kpi-title">الأشخاص (Active)</div></div>
+            <div class="kpi-card"><div class="kpi-num">{m['fps']:.1f}</div><div class="kpi-title">المعالجة (FPS)</div></div>
+            <div class="kpi-card"><div class="kpi-num" style="color:#EF4444">{n_alerts}</div><div class="kpi-title">البلاغات (Alerts)</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_triage(holder, alerts):
+    with holder:
+        if not alerts:
+            st.info("لا توجد بلاغات إسعافية أو أمنية حرجة حتى الآن. النظام يراقب المؤشرات الحركية...")
+            return
+
+        for idx, a in enumerate(reversed(alerts)):
+            info = TAXONOMY_RULES.get(a.condition_key, TAXONOMY_RULES["sudden_fall"])
+            b_color = PRIORITY_COLOR[info["priority"]]
+            st.markdown(
+                f"""
+                <div class="alert-card" style="border-left: 6px solid {b_color};">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span class="triage-badge" style="background:{b_color}">{info['priority']} PRIORITY</span>
+                        <span class="card-meta">#{a.id} · {a.wall_clock} · t={a.video_time_s:.1f}s</span>
+                    </div>
+                    <div style="margin-top:0.3rem;"><span class="category-tag">📂 {info['category']}</span></div>
+                    <div class="card-ar">{info['icon']} {info['ar']}</div>
+                    <div class="card-en"><b>Class:</b> <code>{info['en']}</code> (الثقة: {a.confidence*100:.0f}%)</div>
+                    <div class="card-meta">📍 {a.location}</div>
+                    <div style="margin-top:0.4rem; font-size:0.8rem; color:#CBD5E1;"><b>الإجراء الموصى به:</b> {info['action']}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            b1, b2 = st.columns([1.3, 1])
+            with b1:
+                if not a.dispatched:
+                    if st.button("🚑 توجيه فرقة التدخل السريع", key=f"btn_dsp_{a.unique_key}_{idx}", type="primary"):
+                        a.dispatched = True
+                        st.rerun(scope="fragment")
+                else:
+                    st.button("✅ تم توجيه الفرقة بنجاح", key=f"btn_done_{a.unique_key}_{idx}", disabled=True)
+            with b2:
+                if a.dispatched:
+                    st.markdown('<div class="eta-box">🚨 الفرقة في الطريق (وصول: دقيقة ونصف)</div>', unsafe_allow_html=True)
+            st.write("")
+
+
+def _placeholder_image(w, h):
+    img = np.full((h, w, 3), (11, 19, 43), dtype=np.uint8)
+    cv2.putText(img, "BASEER MULTI-MODAL TRIAGE", (int(w * 0.19), int(h * 0.49)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (72, 202, 228), 2, cv2.LINE_AA)
+    cv2.putText(img, "اضغط بدء الرصد للتشغيل الميداني", (int(w * 0.25), int(h * 0.59)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (144, 224, 239), 1, cv2.LINE_AA)
+    return img
+
+
+@st.fragment(run_every=_frame_interval)
+def live_dashboard():
+    ss = st.session_state
+    col_cam, col_triage = st.columns([1.35, 1])
+
+    with col_cam:
+        st.markdown("##### 📹 البث التحليلي المباشر (Analytical Feed)")
+        cam_holder = st.empty()
+        kpi_holder = st.empty()
+
+    with col_triage:
+        st.markdown("##### 🚨 سجل الفرز والتوجيه الميداني (Live Triage Log)")
+        triage_holder = st.container()
+
+    if ss.playing:
+        advance_one_frame(sens, ss.zone_at_start or selected_zone)
+        if ss.proc >= ss.total_frames:
+            _cleanup_playback()
+            ss.playing = False
+            st.rerun()  # full app rerun: redefines run_every=None, stops auto-ticking
+
+    if ss.last_img is not None:
+        cam_holder.image(ss.last_img, use_container_width=True, output_format="JPEG")
+    else:
+        cam_holder.image(_placeholder_image(ss.w, ss.h), use_container_width=True)
+
+    _render_kpis(kpi_holder, ss.metrics, len(ss.alerts))
+    _render_triage(triage_holder, ss.alerts)
+
+
+live_dashboard()
